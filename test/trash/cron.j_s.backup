@@ -1,0 +1,471 @@
+/**
+ * Cron job scheduler for Twitter Autobot
+ * Handles daily tweet generation and posting at 14:30 UTC (8:00 PM IST)
+ */
+
+const cron = require('node-cron');
+const { scrapeAllSources } = require('./scraper');
+const { selectBestTopic, generateTweet } = require('./gemini');
+const { postTweet } = require('./twitter');
+const { createLogger } = require('./logger');
+const { withRetry, withFallback, ERROR_CATEGORIES } = require('./error-handler');
+
+const logger = createLogger('CRON');
+
+/**
+ * Main job orchestration function that coordinates all pipeline steps
+ * Executes the complete flow: scrape → select → generate → post
+ * @returns {Promise<boolean>} - Returns true if job completed successfully
+ */
+async function dailyTweetJob() {
+    const jobId = `job-${Date.now()}`;
+    const operation = logger.startOperation('Daily tweet job', {
+        jobId,
+        scheduledTime: '14:30 UTC',
+        localTime: new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' }) + ' IST'
+    });
+
+    logger.info('Starting daily tweet job', {
+        jobId,
+        utcTime: new Date().toISOString(),
+        istTime: new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' }) + ' IST',
+        processId: process.pid
+    });
+
+    const jobStats = {
+        topicsScraped: 0,
+        selectedTopic: null,
+        tweetGenerated: false,
+        tweetPosted: false,
+        errors: []
+    };
+
+    try {
+        // Step 1: Scrape topics from all sources with enhanced error handling
+        const scrapingOperation = logger.startOperation('Step 1: Topic scraping', { jobId });
+
+        let topics = [];
+        try {
+            // Use retry mechanism for scraping with fallback to partial results
+            topics = await withFallback(
+                // Primary operation: scrape all sources
+                () => withRetry(
+                    () => scrapeAllSources(),
+                    {
+                        operationName: 'scrape all sources',
+                        context: { jobId, step: 'scraping' }
+                    }
+                ),
+                // Fallback operation: return empty array to continue with manual topics if needed
+                async () => {
+                    logger.warn('Scraping fallback activated - using empty topics array', { jobId });
+                    return [];
+                },
+                {
+                    operationName: 'topic scraping',
+                    fallbackName: 'empty topics fallback',
+                    context: { jobId }
+                }
+            );
+
+            jobStats.topicsScraped = topics.length;
+
+            if (topics.length === 0) {
+                const error = new Error('No topics were scraped from any source');
+                scrapingOperation.fail(error, { topicsFound: 0 });
+                jobStats.errors.push({ step: 'scraping', error: error.message });
+
+                logger.error('Job failed: No topics available', error, { jobId });
+                operation.fail(error, { ...jobStats, failureStep: 'scraping' });
+                return false;
+            }
+
+            scrapingOperation.end('completed', { topicsScraped: topics.length });
+            logger.info('Topic scraping completed successfully', {
+                jobId,
+                topicsCount: topics.length
+            });
+
+        } catch (error) {
+            scrapingOperation.fail(error);
+            jobStats.errors.push({ step: 'scraping', error: error.message });
+
+            logger.error('Critical error in topic scraping', error, { jobId });
+            operation.fail(error, { ...jobStats, failureStep: 'scraping' });
+            return false;
+        }
+
+        // Step 2: Select best topic using AI with enhanced error handling
+        const selectionOperation = logger.startOperation('Step 2: Topic selection', { jobId });
+
+        let selectedTopic;
+        try {
+            selectedTopic = await withRetry(
+                () => selectBestTopic(topics),
+                {
+                    operationName: 'topic selection',
+                    context: { jobId, step: 'selection', topicsCount: topics.length }
+                }
+            );
+
+            jobStats.selectedTopic = selectedTopic;
+
+            selectionOperation.end('completed', {
+                selectedTopic: selectedTopic.substring(0, 100) + '...'
+            });
+
+            logger.info('Topic selection completed successfully', {
+                jobId,
+                selectedTopic: selectedTopic.substring(0, 100) + (selectedTopic.length > 100 ? '...' : ''),
+                topicLength: selectedTopic.length
+            });
+
+        } catch (error) {
+            selectionOperation.fail(error);
+            jobStats.errors.push({ step: 'selection', error: error.message });
+
+            logger.error('Critical error in topic selection', error, {
+                jobId,
+                topicsAvailable: topics.length
+            });
+            operation.fail(error, { ...jobStats, failureStep: 'selection' });
+            return false;
+        }
+
+        // Step 3: Generate tweet using AI with enhanced error handling
+        const generationOperation = logger.startOperation('Step 3: Tweet generation', { jobId });
+
+        let tweetText;
+        try {
+            tweetText = await withRetry(
+                () => generateTweet(selectedTopic),
+                {
+                    operationName: 'tweet generation',
+                    context: { jobId, step: 'generation', selectedTopic: selectedTopic.substring(0, 50) }
+                }
+            );
+
+            jobStats.tweetGenerated = true;
+
+            // Validate tweet meets requirements
+            const tweetValidation = {
+                length: tweetText.length,
+                isValidLength: tweetText.length >= 200 && tweetText.length <= 270,
+                hasHashtags: /#\w+/.test(tweetText),
+                hasEmojis: /[\u{1F600}-\u{1F64F}]|[\u{1F300}-\u{1F5FF}]|[\u{1F680}-\u{1F6FF}]|[\u{1F1E0}-\u{1F1FF}]/u.test(tweetText)
+            };
+
+            if (!tweetValidation.isValidLength) {
+                logger.warn('Generated tweet length is outside optimal range', {
+                    jobId,
+                    actualLength: tweetValidation.length,
+                    targetRange: '200-270',
+                    tweetPreview: tweetText.substring(0, 50) + '...'
+                });
+            }
+
+            generationOperation.end('completed', {
+                tweetLength: tweetText.length,
+                isValidLength: tweetValidation.isValidLength
+            });
+
+            logger.info('Tweet generation completed successfully', {
+                jobId,
+                tweetLength: tweetText.length,
+                tweetPreview: tweetText.substring(0, 100) + (tweetText.length > 100 ? '...' : ''),
+                validation: tweetValidation
+            });
+
+        } catch (error) {
+            generationOperation.fail(error);
+            jobStats.errors.push({ step: 'generation', error: error.message });
+
+            logger.error('Critical error in tweet generation', error, {
+                jobId,
+                selectedTopic: selectedTopic.substring(0, 100) + '...'
+            });
+            operation.fail(error, { ...jobStats, failureStep: 'generation' });
+            return false;
+        }
+
+        // Step 4: Post tweet to Twitter with enhanced error handling
+        const postingOperation = logger.startOperation('Step 4: Tweet posting', { jobId });
+
+        try {
+            const postSuccess = await withRetry(
+                () => postTweet(tweetText),
+                {
+                    operationName: 'tweet posting',
+                    context: {
+                        jobId,
+                        step: 'posting',
+                        tweetLength: tweetText.length,
+                        tweetPreview: tweetText.substring(0, 50)
+                    }
+                }
+            );
+
+            jobStats.tweetPosted = postSuccess;
+
+            if (postSuccess) {
+                postingOperation.end('completed', { posted: true });
+
+                logger.info('Tweet posting completed successfully', {
+                    jobId,
+                    tweetLength: tweetText.length,
+                    tweetPreview: tweetText.substring(0, 100) + '...'
+                });
+            } else {
+                const error = new Error('Tweet posting failed');
+                postingOperation.fail(error, { posted: false });
+                jobStats.errors.push({ step: 'posting', error: 'Tweet posting failed' });
+
+                logger.error('Tweet posting failed', error, {
+                    jobId,
+                    tweetContent: tweetText,
+                    fallbackAction: 'Tweet content logged for manual posting'
+                });
+            }
+
+        } catch (error) {
+            postingOperation.fail(error);
+            jobStats.errors.push({ step: 'posting', error: error.message });
+
+            logger.error('Critical error in tweet posting', error, {
+                jobId,
+                tweetContent: tweetText,
+                fallbackAction: 'Tweet content logged for manual posting'
+            });
+        }
+
+        // Job completion summary
+        const jobSuccess = jobStats.tweetPosted;
+        const jobSummary = {
+            jobId,
+            success: jobSuccess,
+            topicsScraped: jobStats.topicsScraped,
+            selectedTopic: jobStats.selectedTopic?.substring(0, 100) + '...',
+            tweetGenerated: jobStats.tweetGenerated,
+            tweetPosted: jobStats.tweetPosted,
+            tweetLength: tweetText?.length || 0,
+            errorsCount: jobStats.errors.length,
+            errors: jobStats.errors.length > 0 ? jobStats.errors : undefined
+        };
+
+        if (jobSuccess) {
+            logger.info('Daily tweet job completed successfully', jobSummary);
+            operation.end('completed', jobSummary);
+            return true;
+        } else {
+            logger.warn('Daily tweet job completed with errors', jobSummary);
+            operation.end('completed with errors', jobSummary);
+            return false;
+        }
+
+    } catch (error) {
+        // This should catch any unexpected errors not handled above
+        jobStats.errors.push({ step: 'unknown', error: error.message });
+
+        logger.error('Critical error in daily tweet job', error, {
+            jobId,
+            jobStats,
+            unexpectedError: true,
+            errorStack: error.stack
+        });
+
+        operation.fail(error, {
+            ...jobStats,
+            criticalFailure: true,
+            failureStep: 'unknown'
+        });
+
+        return false;
+    }
+}
+
+/**
+ * Initializes and starts the cron job scheduler
+ * Schedules daily execution at 14:30 UTC (8:00 PM IST)
+ * @returns {cron.ScheduledTask} - The scheduled cron task
+ */
+function initializeCronScheduler() {
+    const operation = logger.startOperation('Cron scheduler initialization');
+
+    try {
+        logger.info('Initializing cron job scheduler', {
+            cronExpression: '30 14 * * *',
+            timezone: 'UTC',
+            description: '14:30 UTC daily (8:00 PM IST)'
+        });
+
+        // Cron expression: '30 14 * * *' = 14:30 UTC daily
+        // This translates to 8:00 PM IST (UTC+5:30)
+        const cronExpression = '30 14 * * *';
+
+        const task = cron.schedule(cronExpression, async () => {
+            logger.info('Cron job triggered', {
+                triggerTime: new Date().toISOString(),
+                istTime: new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' }) + ' IST'
+            });
+
+            try {
+                await dailyTweetJob();
+            } catch (error) {
+                logger.error('Unhandled error in cron job execution', error, {
+                    cronTriggerTime: new Date().toISOString(),
+                    errorInCronWrapper: true
+                });
+            }
+        }, {
+            scheduled: true,
+            timezone: 'UTC'
+        });
+
+        // Log next execution time
+        const now = new Date();
+        const nextExecution = getNextExecutionTime();
+
+        logger.info('Cron job scheduler initialized successfully', {
+            currentTime: now.toISOString(),
+            nextExecutionUTC: nextExecution.toISOString(),
+            nextExecutionIST: nextExecution.toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' }) + ' IST',
+            timeUntilNext: formatDuration(nextExecution.getTime() - now.getTime())
+        });
+
+        operation.end('completed', {
+            nextExecution: nextExecution.toISOString(),
+            cronExpression
+        });
+
+        return task;
+
+    } catch (error) {
+        logger.error('Failed to initialize cron scheduler', error);
+        operation.fail(error);
+        throw error;
+    }
+}
+
+/**
+ * Calculates the next execution time for the cron job
+ * @returns {Date} - Next execution time as Date object
+ */
+function getNextExecutionTime() {
+    const now = new Date();
+    const nextExecution = new Date();
+
+    // Set to 14:30 UTC today
+    nextExecution.setUTCHours(14, 30, 0, 0);
+
+    // If today's execution time has passed, schedule for tomorrow
+    if (nextExecution <= now) {
+        nextExecution.setUTCDate(nextExecution.getUTCDate() + 1);
+    }
+
+    return nextExecution;
+}
+
+/**
+ * Stops the cron job scheduler
+ * @param {cron.ScheduledTask} task - The cron task to stop
+ */
+function stopCronScheduler(task) {
+    const operation = logger.startOperation('Cron scheduler shutdown');
+
+    try {
+        if (task) {
+            task.stop();
+            logger.info('Cron job scheduler stopped successfully');
+            operation.end('completed');
+        } else {
+            logger.warn('No cron task provided to stop');
+            operation.end('completed', { noTaskToStop: true });
+        }
+    } catch (error) {
+        logger.error('Error stopping cron scheduler', error);
+        operation.fail(error);
+    }
+}
+
+/**
+ * Gets the current status of the cron job
+ * @param {cron.ScheduledTask} task - The cron task to check
+ * @returns {Object} - Status information
+ */
+function getCronStatus(task) {
+    const nextExecution = getNextExecutionTime();
+    const now = new Date();
+    const timeUntilNext = nextExecution.getTime() - now.getTime();
+
+    return {
+        isRunning: task ? (task.running !== undefined ? task.running : true) : false,
+        nextExecution: nextExecution.toISOString(),
+        nextExecutionIST: nextExecution.toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' }),
+        timeUntilNext: Math.max(0, timeUntilNext),
+        timeUntilNextFormatted: formatDuration(timeUntilNext)
+    };
+}
+
+/**
+ * Formats duration in milliseconds to human-readable format
+ * @param {number} ms - Duration in milliseconds
+ * @returns {string} - Formatted duration string
+ */
+function formatDuration(ms) {
+    if (ms <= 0) return '0 seconds';
+
+    const seconds = Math.floor(ms / 1000);
+    const minutes = Math.floor(seconds / 60);
+    const hours = Math.floor(minutes / 60);
+    const days = Math.floor(hours / 24);
+
+    if (days > 0) {
+        return `${days}d ${hours % 24}h ${minutes % 60}m`;
+    } else if (hours > 0) {
+        return `${hours}h ${minutes % 60}m`;
+    } else if (minutes > 0) {
+        return `${minutes}m ${seconds % 60}s`;
+    } else {
+        return `${seconds}s`;
+    }
+}
+
+/**
+ * Manual trigger for testing the daily job
+ * Useful for testing without waiting for the scheduled time
+ * @returns {Promise<boolean>} - Returns true if job completed successfully
+ */
+async function triggerManualJob() {
+    logger.info('Manual job trigger initiated', {
+        triggerTime: new Date().toISOString(),
+        triggeredBy: 'manual',
+        purpose: 'testing'
+    });
+
+    try {
+        const result = await dailyTweetJob();
+
+        logger.info('Manual job trigger completed', {
+            success: result,
+            completionTime: new Date().toISOString()
+        });
+
+        return result;
+    } catch (error) {
+        logger.error('Manual job trigger failed', error, {
+            triggerTime: new Date().toISOString(),
+            manualTrigger: true
+        });
+
+        return false;
+    }
+}
+
+module.exports = {
+    dailyTweetJob,
+    initializeCronScheduler,
+    stopCronScheduler,
+    getCronStatus,
+    getNextExecutionTime,
+    triggerManualJob
+};

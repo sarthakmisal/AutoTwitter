@@ -1,0 +1,399 @@
+const { GoogleGenerativeAI } = require('@google/generative-ai');
+const { createLogger } = require('./logger');
+const { withRetry, categorizeError, ERROR_CATEGORIES } = require('./error-handler');
+
+const logger = createLogger('GEMINI');
+
+// Initialize Gemini AI client with error handling
+let genAI;
+let model;
+
+try {
+    if (!process.env.GEMINI_API_KEY) {
+        throw new Error('GEMINI_API_KEY environment variable is not set');
+    }
+
+    genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+    model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
+
+    logger.info('Gemini AI client initialized successfully', {
+        model: 'gemini-1.5-flash',
+        hasApiKey: !!process.env.GEMINI_API_KEY
+    });
+} catch (error) {
+    logger.error('Failed to initialize Gemini AI client', error);
+    throw error;
+}
+
+// System prompt for topic selection
+const TOPIC_SELECTION_PROMPT = `You are a viral tweet strategist. From the following list of trending topics, pick the single most controversial, emotionally charged, or debate-worthy topic that will get maximum engagement from Indian Gen Z and millennial Twitter users. Return ONLY the chosen topic as plain text, nothing else.`;
+
+// System prompt for tweet generation
+const TWEET_GENERATION_PROMPT = `You are a savage, unfiltered Gen Z Indian Twitter personality who writes viral tweets. You write in Hinglish (mix of Hindi and English). Your tweets are bold, slightly controversial, emotionally triggering in a fun way, or deeply relatable. You use lowercase, occasional typos for authenticity, slang like 'bro', 'yaar', 'no cap', 'fr fr', 'slay', 'touch grass', 'main character energy', 'rent free', 'understood the assignment'. You NEVER sound corporate or boring. Tweets should feel like a real person typed it at midnight while angry or amused.`;
+
+/**
+ * Select the best topic from an array of topics using Gemini AI
+ * @param {string[]} topics - Array of topic strings
+ * @returns {Promise<string>} - Selected topic as a single string
+ */
+async function selectBestTopic(topics) {
+    const operation = logger.startOperation('Topic selection', {
+        topicsCount: topics?.length || 0,
+        model: 'gemini-1.5-flash'
+    });
+
+    // Enhanced input validation
+    if (!topics || topics.length === 0) {
+        const error = new Error('No topics provided for selection');
+        logger.error('Topic selection failed: No topics provided', error, {
+            topics,
+            topicsType: typeof topics,
+            isArray: Array.isArray(topics),
+            inputValidation: 'failed'
+        });
+        operation.fail(error, { inputValidation: 'failed' });
+        throw error;
+    }
+
+    if (!Array.isArray(topics)) {
+        const error = new Error('Topics must be provided as an array');
+        logger.error('Topic selection failed: Invalid topics format', error, {
+            topics,
+            topicsType: typeof topics,
+            inputValidation: 'failed'
+        });
+        operation.fail(error, { inputValidation: 'failed', topicsType: typeof topics });
+        throw error;
+    }
+
+    // Validate individual topics
+    const validTopics = topics.filter(topic =>
+        topic &&
+        typeof topic === 'string' &&
+        topic.trim().length > 0 &&
+        topic.trim().length <= 1000 // Reasonable length limit
+    );
+
+    if (validTopics.length === 0) {
+        const error = new Error('No valid topics found after filtering');
+        logger.error('Topic selection failed: All topics invalid', error, {
+            originalCount: topics.length,
+            validCount: validTopics.length,
+            inputValidation: 'failed'
+        });
+        operation.fail(error, { inputValidation: 'failed', originalCount: topics.length });
+        throw error;
+    }
+
+    if (validTopics.length !== topics.length) {
+        logger.warn('Some topics were filtered out due to validation', {
+            originalCount: topics.length,
+            validCount: validTopics.length,
+            filteredCount: topics.length - validTopics.length
+        });
+    }
+
+    const topicsText = validTopics.join('\n- ');
+    const userPrompt = `Topics:\n- ${topicsText}`;
+
+    // Enhanced retry mechanism with exponential backoff
+    const retryConfig = {
+        maxRetries: 3,
+        baseDelay: 1000,
+        maxDelay: 10000,
+        backoffMultiplier: 2
+    };
+
+    let lastError = null;
+
+    for (let attempt = 1; attempt <= retryConfig.maxRetries; attempt++) {
+        const isRetry = attempt > 1;
+
+        try {
+            logger.apiCall('Gemini', 'generateContent (topic selection)', {
+                topicsCount: validTopics.length,
+                promptLength: userPrompt.length,
+                systemPromptType: 'viral_strategist',
+                attempt,
+                isRetry
+            });
+
+            const result = await model.generateContent(`${TOPIC_SELECTION_PROMPT}\n\n${userPrompt}`);
+
+            if (!result || !result.response) {
+                throw new Error('Gemini returned null or invalid response object');
+            }
+
+            const selectedTopic = result.response.text().trim();
+
+            // Enhanced response validation
+            if (!selectedTopic || selectedTopic.length === 0) {
+                throw new Error('Gemini returned empty response for topic selection');
+            }
+
+            if (selectedTopic.length > 1000) {
+                logger.warn('Selected topic is unusually long', {
+                    selectedTopicLength: selectedTopic.length,
+                    topicPreview: selectedTopic.substring(0, 100) + '...'
+                });
+            }
+
+            // Enhanced topic validation - check if selected topic relates to input topics
+            const isValidSelection = validTopics.some(topic => {
+                const topicLower = topic.toLowerCase();
+                const selectedLower = selectedTopic.toLowerCase();
+
+                // Check for various matching criteria
+                return topicLower.includes(selectedLower) ||
+                    selectedLower.includes(topicLower) ||
+                    // Check for common words (at least 2 words in common)
+                    topicLower.split(' ').filter(word =>
+                        word.length > 3 && selectedLower.includes(word)
+                    ).length >= 2;
+            });
+
+            const responseAnalysis = {
+                selectedTopic: selectedTopic.substring(0, 100) + (selectedTopic.length > 100 ? '...' : ''),
+                responseLength: selectedTopic.length,
+                isValidSelection,
+                topicsProcessed: validTopics.length,
+                attempt,
+                isRetry,
+                matchingCriteria: isValidSelection ? 'found' : 'not_found'
+            };
+
+            logger.apiResponse('Gemini', 'generateContent (topic selection)', true, responseAnalysis);
+
+            if (!isValidSelection) {
+                logger.warn('Selected topic does not closely match any input topic', {
+                    selectedTopic: selectedTopic.substring(0, 100),
+                    inputTopicsCount: validTopics.length,
+                    inputTopicsPreview: validTopics.slice(0, 3).map(t => t.substring(0, 50)),
+                    attempt
+                });
+            }
+
+            operation.end('completed', {
+                selectedTopic: selectedTopic.substring(0, 50) + '...',
+                responseLength: selectedTopic.length,
+                attempt,
+                retriesUsed: attempt - 1
+            });
+
+            return selectedTopic;
+
+        } catch (error) {
+            lastError = error;
+            const isLastAttempt = attempt >= retryConfig.maxRetries;
+
+            // Enhanced error categorization
+            const errorDetails = {
+                errorType: error.name,
+                errorMessage: error.message,
+                topicsCount: validTopics.length,
+                attempt,
+                maxAttempts: retryConfig.maxRetries,
+                isLastAttempt,
+                isRetryable: true
+            };
+
+            // Categorize Gemini-specific errors
+            if (error.message.includes('API key')) {
+                errorDetails.errorCategory = 'authentication';
+                errorDetails.isRetryable = false;
+                errorDetails.suggestion = 'Check GEMINI_API_KEY environment variable';
+            } else if (error.message.includes('quota') || error.message.includes('limit')) {
+                errorDetails.errorCategory = 'quota_exceeded';
+                errorDetails.suggestion = 'API quota exceeded, try again later';
+            } else if (error.message.includes('safety') || error.message.includes('blocked')) {
+                errorDetails.errorCategory = 'content_filtered';
+                errorDetails.suggestion = 'Content may have been filtered by safety systems';
+            } else if (error.message.includes('timeout') || error.code === 'ECONNABORTED') {
+                errorDetails.errorCategory = 'timeout';
+                errorDetails.suggestion = 'Request timed out, retrying';
+            } else if (error.message.includes('network') || error.code === 'ENOTFOUND') {
+                errorDetails.errorCategory = 'network_error';
+                errorDetails.suggestion = 'Network connectivity issue';
+            } else if (error.message.includes('empty response')) {
+                errorDetails.errorCategory = 'empty_response';
+                errorDetails.suggestion = 'Gemini returned empty response';
+            } else {
+                errorDetails.errorCategory = 'unknown';
+            }
+
+            logger.apiResponse('Gemini', 'generateContent (topic selection)', false, errorDetails);
+
+            if (isLastAttempt || !errorDetails.isRetryable) {
+                const finalError = new Error(`Topic selection failed after ${attempt} attempts: ${error.message}`);
+                logger.error('Topic selection completely failed', finalError, {
+                    ...errorDetails,
+                    originalError: error.message,
+                    totalAttempts: attempt,
+                    fallbackAction: 'No fallback available, throwing error'
+                });
+
+                operation.fail(finalError, {
+                    ...errorDetails,
+                    originalError: error.message,
+                    totalAttempts: attempt
+                });
+
+                throw finalError;
+            } else {
+                // Calculate delay with exponential backoff
+                const delay = Math.min(
+                    retryConfig.baseDelay * Math.pow(retryConfig.backoffMultiplier, attempt - 1),
+                    retryConfig.maxDelay
+                );
+
+                logger.warn(`Topic selection attempt ${attempt} failed, retrying in ${delay}ms`, {
+                    ...errorDetails,
+                    retryDelay: delay,
+                    backoffStrategy: 'exponential'
+                });
+
+                await new Promise(resolve => setTimeout(resolve, delay));
+            }
+        }
+    }
+
+    // This should never be reached due to the loop structure, but included for safety
+    const error = new Error('Topic selection failed after all retry attempts');
+    operation.fail(error, { unexpectedFallthrough: true });
+    throw error;
+}
+
+/**
+ * Generate a tweet based on the selected topic using Gemini AI
+ * @param {string} topic - The selected topic
+ * @returns {Promise<string>} - Generated tweet text (200-270 characters)
+ */
+async function generateTweet(topic) {
+    const operation = logger.startOperation('Tweet generation', {
+        topicLength: topic?.length || 0,
+        model: 'gemini-1.5-flash'
+    });
+
+    // Input validation
+    if (!topic || topic.trim().length === 0) {
+        const error = new Error('No topic provided for tweet generation');
+        operation.fail(error, { inputValidation: 'failed' });
+        throw error;
+    }
+
+    if (typeof topic !== 'string') {
+        const error = new Error('Topic must be provided as a string');
+        operation.fail(error, { inputValidation: 'failed', topicType: typeof topic });
+        throw error;
+    }
+
+    const cleanTopic = topic.trim();
+    const userPrompt = `Today's hot topic: ${cleanTopic}
+
+Write ONE viral tweet about this. Rules:
+- Between 200–270 characters (not too short, not too long — the sweet spot people don't scroll past)
+- Must have a hook in the first 5 words that stops the thumb
+- Add 1–2 spicy takes or unpopular opinions
+- End with something that forces replies (a question, a hot take, or a 'fight me' energy statement)  
+- Add 2–3 relevant hashtags naturally woven in OR at the end
+- Hinglish preferred but full English is fine if it flows better
+- NO emojis overload — max 2, only if they add fire
+- Sound like a real Indian person, not an AI
+- Do NOT start with 'I' or 'So'
+
+Return ONLY the tweet text. Nothing else.`;
+
+    logger.apiCall('Gemini', 'generateContent (tweet generation)', {
+        topicLength: cleanTopic.length,
+        promptLength: userPrompt.length,
+        systemPromptType: 'gen_z_indian'
+    });
+
+    try {
+        const result = await model.generateContent(`${TWEET_GENERATION_PROMPT}\n\n${userPrompt}`);
+        const tweetText = result.response.text().trim();
+
+        // Validate tweet content
+        if (!tweetText || tweetText.length === 0) {
+            throw new Error('Gemini returned empty response for tweet generation');
+        }
+
+        // Character count validation and warnings
+        const isOptimalLength = tweetText.length >= 200 && tweetText.length <= 270;
+        const characterAnalysis = {
+            length: tweetText.length,
+            isOptimalLength,
+            tooShort: tweetText.length < 200,
+            tooLong: tweetText.length > 270
+        };
+
+        // Content quality checks
+        const qualityChecks = {
+            hasHashtags: /#\w+/.test(tweetText),
+            hasEmojis: /[\u{1F600}-\u{1F64F}]|[\u{1F300}-\u{1F5FF}]|[\u{1F680}-\u{1F6FF}]|[\u{1F1E0}-\u{1F1FF}]/u.test(tweetText),
+            startsWithI: /^I\s/.test(tweetText),
+            startsWithSo: /^So\s/.test(tweetText),
+            emojiCount: (tweetText.match(/[\u{1F600}-\u{1F64F}]|[\u{1F300}-\u{1F5FF}]|[\u{1F680}-\u{1F6FF}]|[\u{1F1E0}-\u{1F1FF}]/gu) || []).length
+        };
+
+        logger.apiResponse('Gemini', 'generateContent (tweet generation)', true, {
+            ...characterAnalysis,
+            ...qualityChecks,
+            topic: cleanTopic.substring(0, 50) + (cleanTopic.length > 50 ? '...' : ''),
+            tweetPreview: tweetText.substring(0, 50) + '...'
+        });
+
+        // Log warnings for suboptimal content
+        if (!isOptimalLength) {
+            logger.warn(`Generated tweet length ${tweetText.length} is outside optimal range (200-270 chars)`, {
+                actualLength: tweetText.length,
+                targetRange: '200-270',
+                tweetPreview: tweetText.substring(0, 100) + '...'
+            });
+        }
+
+        if (qualityChecks.startsWithI || qualityChecks.startsWithSo) {
+            logger.warn('Generated tweet starts with discouraged words', {
+                startsWithI: qualityChecks.startsWithI,
+                startsWithSo: qualityChecks.startsWithSo,
+                tweetStart: tweetText.substring(0, 20) + '...'
+            });
+        }
+
+        if (qualityChecks.emojiCount > 2) {
+            logger.warn(`Generated tweet has too many emojis (${qualityChecks.emojiCount} > 2)`, {
+                emojiCount: qualityChecks.emojiCount,
+                maxAllowed: 2
+            });
+        }
+
+        operation.end('completed', {
+            tweetLength: tweetText.length,
+            isOptimalLength,
+            qualityScore: Object.values(qualityChecks).filter(Boolean).length
+        });
+
+        return tweetText;
+
+    } catch (error) {
+        logger.apiResponse('Gemini', 'generateContent (tweet generation)', false, {
+            errorType: error.name,
+            errorMessage: error.message,
+            topicLength: cleanTopic.length,
+            topic: cleanTopic.substring(0, 50) + '...'
+        });
+
+        const finalError = new Error(`Tweet generation failed: ${error.message}`);
+        operation.fail(finalError, {
+            originalError: error.message,
+            topic: cleanTopic.substring(0, 100)
+        });
+
+        throw finalError;
+    }
+}
+
+module.exports = {
+    selectBestTopic,
+    generateTweet
+};
